@@ -1,0 +1,129 @@
+# Builds VoiceClone (Android APK + unsigned iOS IPA) in a PUBLIC repository, where GitHub Actions is free, while the
+# source stays in the PRIVATE repository: only the app source folders are fetched, with a read-only token, and the
+# recordings, training data and models in the private repository are never copied to the public runner.
+#
+# Put this file at .github/workflows/build.yml in the public repository and add the secret SOURCE_TOKEN
+# (see ci/public-runner/README.md in the private repository).
+name: Build VoiceClone (source stays private)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit of the private source repository
+        type: string
+        default: ccr-85d7b499-9151z3
+      android:
+        description: Build the Android APK
+        type: boolean
+        default: true
+      ios:
+        description: Build the unsigned iOS IPA
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPOSITORY: 555734/voiceclone
+  # The private repository's builds already used numbers up to 83; keep counting upwards so builds can be installed over them.
+  VERSION_CODE_OFFSET: "100"
+
+jobs:
+  android:
+    if: ${{ inputs.android }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch only the app source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: |
+            android
+            ios
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Unit tests and release APK
+        env:
+          PUBLIC_MIXED8_AVAILABLE: "true"
+        run: |
+          export VOICECLONE_VERSION_CODE=$((GITHUB_RUN_NUMBER + VERSION_CODE_OFFSET))
+          gradle -p src/android :app:testDebugUnitTest :app:assembleRelease --console=plain --quiet
+          cp src/android/app/build/outputs/apk/release/app-release.apk voiceclone.apk
+          sha256sum voiceclone.apk | tee voiceclone.apk.sha256
+
+      - name: Publish the APK as a pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="android-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" voiceclone.apk voiceclone.apk.sha256 --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "VoiceClone Android build $((GITHUB_RUN_NUMBER + VERSION_CODE_OFFSET))" \
+            --notes "Signed with the sideload key used by earlier builds, so it installs over them."
+
+  ios:
+    if: ${{ inputs.ios }}
+    runs-on: macos-14
+    steps:
+      - name: Fetch only the app source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: |
+            android
+            ios
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Core tests (also checks the Japanese text encodings on Apple's Foundation)
+        run: swift test --package-path src/ios
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          cd src/ios && xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          cd src/ios
+          xcodebuild -project VoiceClone.xcodeproj -scheme VoiceClone -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Package the unsigned IPA
+        run: |
+          cd src/ios
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/VoiceClone.app Payload/
+          zip -qry ../../VoiceClone-unsigned.ipa Payload
+          cd ../..
+          shasum -a 256 VoiceClone-unsigned.ipa | tee VoiceClone-unsigned.ipa.sha256
+
+      - name: Publish the IPA as a pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="ios-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" VoiceClone-unsigned.ipa VoiceClone-unsigned.ipa.sha256 --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "VoiceClone iOS build ${GITHUB_RUN_NUMBER} (unsigned)" \
+            --notes "Unsigned. Sign it with your own Apple ID (Xcode, AltStore, Sideloadly) to install it on your iPhone."
