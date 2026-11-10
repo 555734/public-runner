@@ -78,7 +78,7 @@ jobs:
 
   ios:
     if: ${{ inputs.ios }}
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Fetch only the app source
         uses: actions/checkout@v4
